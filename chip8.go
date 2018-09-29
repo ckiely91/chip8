@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/rand"
 )
 
 var Chip8Fontset = [80]byte{
@@ -28,12 +29,13 @@ var Chip8Fontset = [80]byte{
 
 type Chip8 struct {
 	opcode uint16
-	i      uint16
+	I      uint16
 	pc     uint16
 	memory [4096]byte
 
-	registers [16]byte
-	gfx       [32][64]bool
+	V        [16]byte
+	gfx      [2048]byte
+	drawFlag bool
 
 	stack [16]uint16
 	sp    uint16
@@ -50,12 +52,12 @@ func NewChip8() *Chip8 {
 
 func (c *Chip8) Initialize() {
 	c.opcode = 0
-	c.i = 0
+	c.I = 0
 	c.sp = 0
 	c.pc = 0x200 // 512
 	c.memory = [4096]byte{}
-	c.registers = [16]byte{}
-	c.gfx = [32][64]bool{}
+	c.V = [16]byte{}
+	c.gfx = [2048]byte{}
 	c.stack = [16]uint16{}
 	c.delayTimer = 0
 	c.soundTimer = 0
@@ -95,103 +97,182 @@ func (c *Chip8) decodeOpcode(opcode uint16) {
 		case 0x0000:
 			// TODO: clear the screen
 
-			// 00EE: Return from a subroutine
+		// 00EE: Return from a subroutine
 		case 0x000E:
-			// TODO: return from a subroutine
+			// I think to return from a subroutine we need to go back up the program stack?
+			// And increment by 2 like normal
+			c.sp--
+			c.pc = c.stack[c.sp] + 2
+
 		default:
 			panic(fmt.Sprintf("Unknown opcode: 0x%X", opcode))
 		}
 
 	// 1NNN: Jumps to address NNN
 	case 0x1000:
-		// TODO: Jump to address NNN
+		c.pc = opcode & 0x0FFF
+		// Don't increment the program counter as we've just jumped!
 
 	// 2NNN: Calls subroutine at NNN
 	case 0x2000:
-		// TODO: call subroutine at NNN
+		// temp jump to NNN, so store the current address in the stack first
+		c.stack[c.sp] = c.pc
+		c.sp++
+		c.pc = opcode & 0x0FFF
+		// Don't increment the program counter as we've just jumped!
 
 	// 3XNN: Skips the next instruction if VX equals NN. (Usually the next instruction is a jump to skip a code block)
 	case 0x3000:
-		// TODO
+		if c.V[(opcode&0x0F00)>>8] == byte(opcode&0x00FF) {
+			// Skip the next instruction
+			c.pc += 2
+		}
+		c.pc += 2
 
 	// 4XNN: Skips the next instruction if VX doesn't equal NN. (Usually the next instruction is a jump to skip a code block)
 	case 0x4000:
-		// TODO
+		if c.V[(opcode&0x0F00)>>8] != byte(opcode&0x00FF) {
+			// Skip the next instruction
+			c.pc += 2
+		}
+		c.pc += 2
 
 	// 5XY0: Skips the next instruction if VX equals VY. (Usually the next instruction is a jump to skip a code block)
 	case 0x5000:
-		// TODO
+		if c.V[(opcode&0x0F00)>>8] == c.V[(opcode&0x00F0)>>4] {
+			// Skip the next instruction
+			c.pc += 2
+		}
+		c.pc += 2
 
 	// 6XNN: Sets VX to NN.
 	case 0x6000:
-		// TODO
+		c.V[(opcode&0x0F00)>>8] = byte(opcode & 0x00FF)
+		c.pc += 2
 
 	// 7XNN: Adds NN to VX. (Carry flag is not changed)
 	case 0x7000:
-		// TODO
+		c.V[(opcode&0x0F00)>>8] += byte(opcode & 0x00FF)
+		c.pc += 2
 
 	case 0x8000:
 		switch opcode & 0x000F {
 		// 8XY0: Sets VX to the value of VY.
 		case 0x0000:
-			// TODO
+			c.V[(opcode&0x0F00)>>8] = c.V[(opcode&0x00F0)>>4]
+			c.pc += 2
 
 		// 8XY1: Sets VX to VX or VY. (Bitwise OR operation)
 		case 0x0001:
-			// TODO
+			c.V[(opcode&0x0F00)>>8] = c.V[(opcode&0x0F00)>>8] | c.V[(opcode&0x00F0)>>4]
+			c.pc += 2
 
 		// 8XY2: Sets VX to VX and VY. (Bitwise AND operation)
 		case 0x0002:
-			// TODO
+			c.V[(opcode&0x0F00)>>8] = c.V[(opcode&0x0F00)>>8] & c.V[(opcode&0x00F0)>>4]
+			c.pc += 2
 
 		// 8XY3: Sets VX to VX xor VY.
 		case 0x0003:
-			// TODO
+			c.V[(opcode&0x0F00)>>8] = c.V[(opcode&0x0F00)>>8] ^ c.V[(opcode&0x00F0)>>4]
+			c.pc += 2
 
 		// 8XY4: Adds VY to VX. VF is set to 1 when there's a carry, and to 0 when there isn't.
 		case 0x0004:
-			// TODO
+			// Explanation on Opcode Example 2 here http://www.multigesture.net/articles/how-to-write-an-emulator-chip-8-interpreter/
+			if c.V[(opcode&0x00F0)>>4] > (0xFF - c.V[(opcode&0x0F00)>>8]) {
+				c.V[0xF] = 1 //carry
+			} else {
+				c.V[0xF] = 0
+			}
+			c.V[(opcode&0x0F00)>>8] += c.V[(opcode&0x00F0)>>4]
+			c.pc += 2
 
 		// 8XY5: VY is subtracted from VX. VF is set to 0 when there's a borrow, and 1 when there isn't.
 		case 0x0005:
-			// TODO
+			vx := c.V[(opcode&0x0F00)>>8]
+			vy := c.V[(opcode&0x00F0)>>4]
+			if vx-vy < 0 {
+				c.V[0xF] = 1 // borrow
+			} else {
+				c.V[0xF] = 0
+			}
+			c.V[(opcode&0x0F00)>>8] = vx - vy
+			c.pc += 2
 
 		// 8XY6: Stores the least significant bit of VX in VF and then shifts VX to the right by 1.
 		case 0x0006:
-			// TODO
+			c.V[0xF] = c.V[(opcode&0x0F00)>>8] & 0x0000000F
+			c.V[(opcode&0x0F00)>>8] = c.V[(opcode&0x0F00)>>8] >> 1
+			c.pc += 2
 
 		// 8XY7: Sets VX to VY minus VX. VF is set to 0 when there's a borrow, and 1 when there isn't.
 		case 0x0007:
-			// TODO
+			vx := c.V[(opcode&0x0F00)>>8]
+			vy := c.V[(opcode&0x00F0)>>4]
+			if vy-vx < 0 {
+				c.V[0xF] = 0 // borrow
+			} else {
+				c.V[0xF] = 1
+			}
+			c.V[(opcode&0x00F0)>>4] = vy - vx
+			c.pc += 2
 
 		// 8XYE: Stores the most significant bit of VX in VF and then shifts VX to the left by 1.
 		case 0x000E:
-			// TODO
+			c.V[0xF] = c.V[(opcode&0x0F00)>>8] >> 7
+			c.V[(opcode&0x0F00)>>8] = c.V[(opcode&0x0F00)>>8] << 1
+			c.pc += 2
 		}
 
 	// 9XY0: Skips the next instruction if VX doesn't equal VY. (Usually the next instruction is a jump to skip a code block)
 	case 0x9000:
-		// TODO
+		if c.V[(opcode&0x0F00)>>8] != c.V[(opcode&0x00F0)>>4] {
+			c.pc += 2
+		}
+		c.pc += 2
 
 	// ANNN: Sets i to the address NNN
 	case 0xA000:
-		c.i = opcode & 0x0FFF
+		c.I = opcode & 0x0FFF
 		c.pc += 2
 
 	// BNNN: Jumps to the address NNN plus V0.
 	case 0xB000:
-		// TODO
+		c.pc = (opcode & 0x0FFF) + uint16(c.V[0])
+		// Don't increment the program counter as we've just jumped
 
 	// CXNN: Sets VX to the result of a bitwise and operation on a random number (Typically: 0 to 255) and NN.
 	case 0xC000:
-		// TODO
+		r := byte(rand.Intn(256))
+		c.V[(opcode&0x0F00)>>8] = r & byte(opcode&0x00FF)
+		c.pc += 2
 
 	// DXYN: Draws a sprite at coordinate (VX, VY) that has a width of 8 pixels and a height of N pixels.
 	// Each row of 8 pixels is read as bit-coded starting from memory location I; I value doesn’t change
 	// after the execution of this instruction. As described above, VF is set to 1 if any screen pixels
 	// are flipped from set to unset when the sprite is drawn, and to 0 if that doesn’t happen
 	case 0xD000:
-		// TODO
+		x := c.V[(opcode&0x0F00)>>8]
+		y := c.V[(opcode&0x00F0)>>4]
+		height := opcode & 0x000F
+
+		// First reset VF
+		c.V[0xF] = 0
+		for yline := uint16(0); yline < height; yline++ {
+			pixel := c.memory[c.I+yline]
+			for xline := uint16(0); xline < 8; xline++ {
+				if pixel&(0x80>>xline) != 0 {
+					if c.gfx[uint16(x)+xline+((uint16(y)+yline)*64)] == 1 {
+						c.V[0xF] = 1
+					}
+
+					c.gfx[uint16(x)+xline+((uint16(y)+yline)*64)] ^= 1
+				}
+			}
+		}
+		c.drawFlag = true
+		c.pc += 2
 
 	case 0xE000:
 		switch opcode & 0x00FF {
@@ -211,7 +292,8 @@ func (c *Chip8) decodeOpcode(opcode uint16) {
 		switch opcode & 0x00FF {
 		// FX07: Sets VX to the value of the delay timer.
 		case 0x0007:
-			// TODO
+			c.V[(opcode&0x0F00)>>8] = c.delayTimer
+			c.pc += 2
 
 		// FX0A: A key press is awaited, and then stored in VX. (Blocking Operation. All instruction halted until next key event)
 		case 0x000A:
@@ -219,15 +301,18 @@ func (c *Chip8) decodeOpcode(opcode uint16) {
 
 		// FX15: Sets the delay timer to VX.
 		case 0x0015:
-			// TODO
+			c.delayTimer = c.V[(opcode&0x0F00)>>8]
+			c.pc += 2
 
 		// FX18: Sets the sound timer to VX.
 		case 0x0018:
-			// TODO
+			c.soundTimer = c.V[(opcode&0x0F00)>>8]
+			c.pc += 2
 
 		// FX1E: Adds VX to I.
 		case 0x001E:
-			// TODO
+			c.I += uint16(c.V[(opcode&0x0F00)>>8])
+			c.pc += 2
 
 		// FX29: Sets I to the location of the sprite for the character in VX. Characters 0-F (in hexadecimal) are represented by a 4x5 font.
 		case 0x0029:
@@ -237,17 +322,29 @@ func (c *Chip8) decodeOpcode(opcode uint16) {
 		// the middle digit at I plus 1, and the least significant digit at I plus 2. (In other words, take the decimal
 		// representation of VX, place the hundreds digit in memory at location in I, the tens digit at location I+1, and the ones digit at location I+2.)
 		case 0x0033:
-			// TODO
+			// Taken from http://www.multigesture.net/wp-content/uploads/mirror/goldroad/chip8.shtml
+			c.memory[c.I] = c.V[(opcode&0x0F00)>>8] / 100
+			c.memory[c.I+1] = (c.V[(opcode&0x0F00)>>8] / 10) % 10
+			c.memory[c.I+2] = (c.V[(opcode&0x0F00)>>8] % 100) % 10
+			c.pc += 2
 
 		// FX55: Stores V0 to VX (including VX) in memory starting at address I.
 		// The offset from I is increased by 1 for each value written, but I itself is left unmodified.
 		case 0x0055:
-			// TODO
+			x := (opcode & 0x0F00) >> 8
+			for i := uint16(0); i < x; i++ {
+				c.memory[c.I+i] = c.V[i]
+			}
+			c.pc += 2
 
 		// FX65: Fills V0 to VX (including VX) with values from memory starting at address I.
 		// The offset from I is increased by 1 for each value written, but I itself is left unmodified.
 		case 0x0065:
-			// TODO
+			x := (opcode & 0x0F00) >> 8
+			for i := uint16(0); i < x; i++ {
+				c.V[i] = c.memory[c.I+i]
+			}
+			c.pc += 2
 
 		default:
 			panic(fmt.Sprintf("Unknown opcode: 0x%X", opcode))
