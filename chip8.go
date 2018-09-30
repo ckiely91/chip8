@@ -1,11 +1,17 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"math/rand"
+	"os"
+	"time"
+
+	"github.com/nsf/termbox-go"
+
+	"azul3d.org/engine/keyboard"
 )
 
 var Chip8Fontset = [80]byte{
@@ -34,7 +40,7 @@ type Chip8 struct {
 	memory [4096]byte
 
 	V        [16]byte
-	gfx      [2048]byte
+	gfx      [2048]byte // 64 x 32
 	drawFlag bool
 
 	stack [16]uint16
@@ -43,7 +49,8 @@ type Chip8 struct {
 	delayTimer uint8
 	soundTimer uint8
 
-	key [16]uint8
+	keys       [16]bool
+	keyWatcher *keyboard.Watcher
 }
 
 func NewChip8() *Chip8 {
@@ -61,6 +68,9 @@ func (c *Chip8) Initialize() {
 	c.stack = [16]uint16{}
 	c.delayTimer = 0
 	c.soundTimer = 0
+	c.keys = [16]bool{}
+	c.keyWatcher = keyboard.NewWatcher()
+	c.drawFlag = true
 
 	// Load fontset into the first 80 addresses of memory
 	for i := 0; i < 80; i++ {
@@ -68,7 +78,7 @@ func (c *Chip8) Initialize() {
 	}
 }
 
-func (c *Chip8) LoadGame(buf *bytes.Buffer) {
+func (c *Chip8) LoadGame(buf *bufio.Reader) {
 	i := 0x200 // 512
 	for {
 		b, err := buf.ReadByte()
@@ -95,7 +105,9 @@ func (c *Chip8) decodeOpcode(opcode uint16) {
 		switch opcode & 0x000F {
 		// 00E0: Clears the screen
 		case 0x0000:
-			// TODO: clear the screen
+			c.gfx = [2048]byte{}
+			c.drawFlag = true
+			c.pc += 2
 
 		// 00EE: Return from a subroutine
 		case 0x000E:
@@ -221,8 +233,11 @@ func (c *Chip8) decodeOpcode(opcode uint16) {
 		// 8XYE: Stores the most significant bit of VX in VF and then shifts VX to the left by 1.
 		case 0x000E:
 			c.V[0xF] = c.V[(opcode&0x0F00)>>8] >> 7
-			c.V[(opcode&0x0F00)>>8] = c.V[(opcode&0x0F00)>>8] << 1
+			c.V[(opcode&0x0F00)>>8] <<= 1
 			c.pc += 2
+
+		default:
+			panic(fmt.Sprintf("Unknown opcode: 0x%X", opcode))
 		}
 
 	// 9XY0: Skips the next instruction if VX doesn't equal VY. (Usually the next instruction is a jump to skip a code block)
@@ -259,15 +274,23 @@ func (c *Chip8) decodeOpcode(opcode uint16) {
 
 		// First reset VF
 		c.V[0xF] = 0
+		idx := uint16(0)
+		defer func() {
+			if r := recover(); r != nil {
+				panic(fmt.Sprintf("attempted to access index %v. x %v, y %v, height %v", idx, x, y, height))
+			}
+		}()
+
 		for yline := uint16(0); yline < height; yline++ {
 			pixel := c.memory[c.I+yline]
 			for xline := uint16(0); xline < 8; xline++ {
 				if pixel&(0x80>>xline) != 0 {
-					if c.gfx[uint16(x)+xline+((uint16(y)+yline)*64)] == 1 {
+					idx = uint16(x) + xline + ((uint16(y) + yline) * 64)
+					if c.gfx[idx] == 1 {
 						c.V[0xF] = 1
 					}
 
-					c.gfx[uint16(x)+xline+((uint16(y)+yline)*64)] ^= 1
+					c.gfx[idx] ^= 1
 				}
 			}
 		}
@@ -278,11 +301,17 @@ func (c *Chip8) decodeOpcode(opcode uint16) {
 		switch opcode & 0x00FF {
 		// EX9E: Skips the next instruction if the key stored in VX is pressed. (Usually the next instruction is a jump to skip a code block)
 		case 0x009E:
-			// TODO
+			if c.keys[(opcode&0x0F00)>>8] {
+				c.pc += 2
+			}
+			c.pc += 2
 
 		// EXA1: Skips the next instruction if the key stored in VX isn't pressed. (Usually the next instruction is a jump to skip a code block)
 		case 0x00A1:
-			// TODO
+			if !c.keys[(opcode&0x0F00)>>8] {
+				c.pc += 2
+			}
+			c.pc += 2
 
 		default:
 			panic(fmt.Sprintf("Unknown opcode: 0x%X", opcode))
@@ -297,7 +326,9 @@ func (c *Chip8) decodeOpcode(opcode uint16) {
 
 		// FX0A: A key press is awaited, and then stored in VX. (Blocking Operation. All instruction halted until next key event)
 		case 0x000A:
-			// TODO
+			newKey := c.awaitKeyPress()
+			c.V[(opcode&0x0F00)>>8] = newKey
+			c.pc += 2
 
 		// FX15: Sets the delay timer to VX.
 		case 0x0015:
@@ -316,7 +347,8 @@ func (c *Chip8) decodeOpcode(opcode uint16) {
 
 		// FX29: Sets I to the location of the sprite for the character in VX. Characters 0-F (in hexadecimal) are represented by a 4x5 font.
 		case 0x0029:
-			// TODO
+			c.I = uint16(c.V[(opcode&0x0F00)>>8] * 0x5)
+			c.pc += 2
 
 		// FX33: Stores the binary-coded decimal representation of VX, with the most significant of three digits at the address in I,
 		// the middle digit at I plus 1, and the least significant digit at I plus 2. (In other words, take the decimal
@@ -335,6 +367,8 @@ func (c *Chip8) decodeOpcode(opcode uint16) {
 			for i := uint16(0); i < x; i++ {
 				c.memory[c.I+i] = c.V[i]
 			}
+			// On the original interpreter, when the operation is done, I = I + X + 1.
+			c.I += x + 1
 			c.pc += 2
 
 		// FX65: Fills V0 to VX (including VX) with values from memory starting at address I.
@@ -344,6 +378,8 @@ func (c *Chip8) decodeOpcode(opcode uint16) {
 			for i := uint16(0); i < x; i++ {
 				c.V[i] = c.memory[c.I+i]
 			}
+			// On the original interpreter, when the operation is done, I = I + X + 1.
+			c.I += x + 1
 			c.pc += 2
 
 		default:
@@ -355,12 +391,92 @@ func (c *Chip8) decodeOpcode(opcode uint16) {
 	}
 }
 
+func (c *Chip8) getKeyState() [16]bool {
+	keys := [16]bool{
+		c.keyWatcher.Down(keyboard.One),
+		c.keyWatcher.Down(keyboard.Two),
+		c.keyWatcher.Down(keyboard.Three),
+		c.keyWatcher.Down(keyboard.Four),
+		c.keyWatcher.Down(keyboard.Q),
+		c.keyWatcher.Down(keyboard.W),
+		c.keyWatcher.Down(keyboard.E),
+		c.keyWatcher.Down(keyboard.R),
+		c.keyWatcher.Down(keyboard.A),
+		c.keyWatcher.Down(keyboard.S),
+		c.keyWatcher.Down(keyboard.D),
+		c.keyWatcher.Down(keyboard.F),
+		c.keyWatcher.Down(keyboard.Z),
+		c.keyWatcher.Down(keyboard.X),
+		c.keyWatcher.Down(keyboard.C),
+		c.keyWatcher.Down(keyboard.V),
+	}
+
+	if c.keyWatcher.Down(keyboard.Escape) {
+		os.Exit(1)
+	}
+
+	return keys
+}
+
+func (c *Chip8) awaitKeyPress() (keyIdx uint8) {
+	for {
+		// Get the current key state every 1/60th of a second
+		newKeys := c.getKeyState()
+		for i := uint8(0); i < 16; i++ {
+			if newKeys[i] && newKeys[i] != c.keys[i] {
+				// Newly pressed key, return it. Set the key state first
+				c.keys = newKeys
+				return i
+			}
+		}
+		time.Sleep(time.Second / 60)
+	}
+}
+
+func (c *Chip8) drawGraphics() {
+	// tm.Clear()
+
+	// for y := 0; y < 32; y++ {
+	// 	for x := 0; x < 64; x++ {
+	// 		if c.gfx[(y*64)+x] == 1 {
+	// 			tm.Printf(tm.Background(" ", tm.WHITE))
+	// 		} else {
+	// 			tm.Printf(tm.Background(" ", tm.BLACK))
+	// 		}
+	// 	}
+	// 	tm.Printf("\n")
+	// }
+	// tm.Printf("\n")
+	// tm.Flush()
+
+	termbox.Clear(termbox.ColorDefault, termbox.ColorDefault)
+
+	for y := 0; y < 32; y++ {
+		for x := 0; x < 64; x++ {
+			if c.gfx[(y*64)+x] == 1 {
+				termbox.SetCell(x, y, ' ', termbox.ColorDefault, termbox.ColorWhite)
+			} else {
+				termbox.SetCell(x, y, ' ', termbox.ColorDefault, termbox.ColorBlack)
+			}
+		}
+	}
+	termbox.Flush()
+}
+
 func (c *Chip8) EmulateCycle() {
 	// First fetch the current opcode.
 	opcode := c.fetchOpcode()
 
 	// Next decode it
 	c.decodeOpcode(opcode)
+
+	// Draw
+	if c.drawFlag {
+		c.drawFlag = false
+		c.drawGraphics()
+	}
+
+	c.keys = c.getKeyState()
 
 	// And update timers
 	if c.delayTimer > 0 {
@@ -373,4 +489,6 @@ func (c *Chip8) EmulateCycle() {
 		}
 		c.soundTimer--
 	}
+
+	time.Sleep(time.Second / 540)
 }
